@@ -1,0 +1,19 @@
+{
+    "extractor": {
+        "twitter": {
+            "videos": true,
+            "retweets": false,
+            "quoted": false,
+            "filename": "{author[name]}_{tweet_id}_{num}.{extension}",
+            "directory": ["{category}", "{subcategory}"]
+        }
+    },
+    "downloader": {
+        "retries": 5,
+        "retry-codes": [429, 500, 502, 503, 504]
+    },
+    "output": {
+        "log": {"level": "info", "format": "[{name}][{levelname}] {message}"},
+        "progress": false
+    }
+}

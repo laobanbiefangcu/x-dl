@@ -1,0 +1,16 @@
+[Unit]
+Description=X-DL Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/x-dl
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/x-dl/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
