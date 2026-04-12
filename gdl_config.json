@@ -10,8 +10,10 @@
     },
     "downloader": {
         "retries": 5,
-        "retry-codes": [429, 500, 502, 503, 504]
+        "retry-codes": [429, 500, 502, 503, 504],
+        "timeout": 30.0
     },
+    "sleep-request": 0.5,
     "output": {
         "log": {"level": "info", "format": "[{name}][{levelname}] {message}"},
         "progress": false

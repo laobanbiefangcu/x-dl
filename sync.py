@@ -2,33 +2,31 @@
 """x-dl: 用 gallery-dl 同步 X (Twitter) 书签/点赞的媒体文件."""
 from __future__ import annotations
 
-import re
+import sys
 import time
 from pathlib import Path
 
+import requests
+
 from xdl.config import load_settings
 from xdl import runner, telegram, cookies as cookie_checker
-
-# 匹配 gallery-dl 生成的文件名: {author}_{tweet_id}_{num}.{ext}
-_FNAME_RE = re.compile(r"^([^_]+)_(\d{10,})_\d+\.")
+from xdl.utils import caption, group_by_tweet, cleanup_empty_dirs
 
 
-def _caption(path: Path) -> str:
-    m = _FNAME_RE.match(path.name)
-    if m:
-        author, tweet_id = m.group(1), m.group(2)
-        return f"@{author}\nhttps://x.com/{author}/status/{tweet_id}"
-    return path.stem
-
-
-def _group_by_tweet(files: list[Path]) -> dict[str, list[Path]]:
-    """同一条推文的多个媒体文件归为一组，作为 media group 发送."""
-    groups: dict[str, list[Path]] = {}
-    for f in files:
-        m = _FNAME_RE.match(f.name)
-        key = m.group(2) if m else f.stem
-        groups.setdefault(key, []).append(f)
-    return groups
+def _notify_tg(settings, text: str) -> None:
+    """向 Telegram 发送一条纯文本通知，失败静默。"""
+    if not settings.telegram_enabled:
+        return
+    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        return
+    try:
+        requests.post(
+            f"{settings.telegram_api_base.rstrip('/')}/bot{settings.telegram_bot_token}/sendMessage",
+            json={"chat_id": settings.telegram_chat_id, "text": text},
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def main() -> None:
@@ -42,7 +40,8 @@ def main() -> None:
         print(f"   ✓ {msg}")
     else:
         print(f"   ✗ {msg}")
-        raise SystemExit("cookies 无效，终止同步。")
+        _notify_tg(settings, f"⚠️ x-dl sync: cookies 无效，已停止同步\n{msg}")
+        sys.exit(0)  # 软退出：cookies 失效是预期状态，不让 systemd 显示 Failed
 
     urls = settings.target_urls()
 
@@ -73,17 +72,17 @@ def main() -> None:
         print("[warn] TELEGRAM_ENABLED=true 但未配置 BOT_TOKEN 或 CHAT_ID，跳过发送。")
         return
 
-    groups = _group_by_tweet(all_new)
+    groups = group_by_tweet(all_new)
     print(f"\n开始发送到 Telegram（共 {len(groups)} 条推文）...")
 
     for tweet_id, files in groups.items():
-        caption = _caption(files[0])
+        cap = caption(files[0])
         try:
             telegram.send_files(
                 files,
                 bot_token=settings.telegram_bot_token,
                 chat_id=settings.telegram_chat_id,
-                caption=caption,
+                caption=cap,
                 api_base=settings.telegram_api_base,
                 proxy=settings.proxy,
                 max_upload_bytes=settings.telegram_max_upload_bytes,
@@ -97,6 +96,7 @@ def main() -> None:
             if settings.delete_after_telegram:
                 for f in files:
                     f.unlink(missing_ok=True)
+                    cleanup_empty_dirs(f, settings.download_dir)
         except telegram.TelegramFileTooLargeError as exc:
             print(f"  [skip] {tweet_id}: {exc}")
         except Exception as exc:  # noqa: BLE001

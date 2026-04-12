@@ -4,19 +4,29 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
 import requests
 
+from .utils import make_proxies
+
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 ANIMATION_SUFFIXES = {".gif"}
+_GROUPABLE_SUFFIXES = IMAGE_SUFFIXES | VIDEO_SUFFIXES  # 预计算，sendMediaGroup 支持的类型
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 
 
 class TelegramFileTooLargeError(RuntimeError):
     pass
+
+
+class TelegramRateLimitError(RuntimeError):
+    def __init__(self, retry_after: int, desc: str = "") -> None:
+        super().__init__(f"Telegram 429: {desc}")
+        self.retry_after = retry_after
 
 
 # ---------------------------------------------------------------------------
@@ -43,15 +53,17 @@ def send_files(
     if not files:
         return
 
-    prepared, temp_files = _prepare(
-        files,
-        max_upload_bytes=max_upload_bytes,
-        split_oversized_video=split_oversized_video,
-        compress_oversized_video=compress_oversized_video,
-        ffmpeg_preset=ffmpeg_preset,
-    )
     kwargs = dict(bot_token=bot_token, chat_id=chat_id, api_base=api_base, proxy=proxy)
-    try:
+
+    with tempfile.TemporaryDirectory() as workdir:
+        prepared = _prepare(
+            files,
+            workdir=Path(workdir),
+            max_upload_bytes=max_upload_bytes,
+            split_oversized_video=split_oversized_video,
+            compress_oversized_video=compress_oversized_video,
+            ffmpeg_preset=ffmpeg_preset,
+        )
         first = True
         for chunk in [prepared[i:i + 10] for i in range(0, len(prepared), 10)]:
             if _can_group(chunk):
@@ -67,9 +79,6 @@ def send_files(
                     _retry(_send_one, send_retries, path,
                            caption=caption if first else "", **kwargs)
                     first = False
-    finally:
-        for t in temp_files:
-            t.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +91,10 @@ def _retry(fn, retries: int, *args, **kwargs) -> None:
         try:
             fn(*args, **kwargs)
             return
+        except TelegramRateLimitError as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(exc.retry_after + 1)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < retries:
@@ -108,7 +121,7 @@ def _send_one(path: Path, *, bot_token: str, chat_id: str, caption: str,
 
     with path.open("rb") as fh:
         resp = requests.post(url, data=data, files={field: (path.name, fh)},
-                             proxies=_proxies(proxy), timeout=120)
+                             proxies=make_proxies(proxy), timeout=120)
     _check(resp)
 
 
@@ -134,7 +147,7 @@ def _send_group(files: list[Path], *, bot_token: str, chat_id: str, caption: str
             url,
             data={"chat_id": chat_id, "media": json.dumps(media, ensure_ascii=True)},
             files=attach,
-            proxies=_proxies(proxy),
+            proxies=make_proxies(proxy),
             timeout=180,
         )
     finally:
@@ -146,7 +159,7 @@ def _send_group(files: list[Path], *, bot_token: str, chat_id: str, caption: str
 def _can_group(files: list[Path]) -> bool:
     if not (2 <= len(files) <= 10):
         return False
-    return all(f.suffix.lower() in IMAGE_SUFFIXES | VIDEO_SUFFIXES for f in files)
+    return all(f.suffix.lower() in _GROUPABLE_SUFFIXES for f in files)
 
 
 def _check(resp: requests.Response) -> None:
@@ -157,16 +170,10 @@ def _check(resp: requests.Response) -> None:
         return
     if not payload.get("ok"):
         desc = payload.get("description", "")
+        retry_after = (payload.get("parameters") or {}).get("retry_after")
+        if resp.status_code == 429 and retry_after:
+            raise TelegramRateLimitError(int(retry_after), desc)
         raise RuntimeError(f"Telegram {resp.status_code}: {desc}")
-
-
-def _proxies(proxy: str) -> dict[str, str] | None:
-    p = proxy.strip()
-    if not p:
-        return None
-    if p.startswith("socks5://"):
-        p = "socks5h://" + p[len("socks5://"):]
-    return {"http": p, "https": p}
 
 
 # ---------------------------------------------------------------------------
@@ -176,13 +183,13 @@ def _proxies(proxy: str) -> dict[str, str] | None:
 def _prepare(
     files: list[Path],
     *,
+    workdir: Path,
     max_upload_bytes: int,
     split_oversized_video: bool,
     compress_oversized_video: bool,
     ffmpeg_preset: str,
-) -> tuple[list[Path], list[Path]]:
+) -> list[Path]:
     prepared: list[Path] = []
-    temps: list[Path] = []
 
     for path in files:
         size = path.stat().st_size
@@ -194,19 +201,15 @@ def _prepare(
                 f"{path.name} ({size} bytes) exceeds Telegram limit ({max_upload_bytes} bytes)."
             )
         if split_oversized_video:
-            chunks = _split(path, max_upload_bytes)
-            prepared.extend(chunks)
-            temps.extend(chunks)
+            prepared.extend(_split(path, max_upload_bytes, workdir))
         elif compress_oversized_video:
-            out = _compress(path, max_upload_bytes, ffmpeg_preset)
-            prepared.append(out)
-            temps.append(out)
+            prepared.append(_compress(path, max_upload_bytes, ffmpeg_preset, workdir))
         else:
             raise TelegramFileTooLargeError(
                 f"{path.name} ({size} bytes) exceeds Telegram limit ({max_upload_bytes} bytes)."
             )
 
-    return prepared, temps
+    return prepared
 
 
 def _require_ffmpeg() -> None:
@@ -221,7 +224,7 @@ def _duration(path: Path) -> float:
     return float(result.stdout.strip() or "0")
 
 
-def _compress(path: Path, limit: int, preset: str) -> Path:
+def _compress(path: Path, limit: int, preset: str, workdir: Path) -> Path:
     _require_ffmpeg()
     dur = _duration(path)
     if dur <= 0:
@@ -229,18 +232,19 @@ def _compress(path: Path, limit: int, preset: str) -> Path:
     audio_br = 64_000
     total_br = int((limit * 8 * 0.92) / dur)
     video_br = max(120_000, total_br - audio_br)
-    out = path.with_name(f"{path.stem}.tg.mp4")
-    subprocess.run(
+    out = workdir / f"{path.stem}.tg.mp4"
+    proc = subprocess.run(
         ["ffmpeg", "-y", "-i", str(path),
          "-movflags", "+faststart",
          "-c:v", "libx264", "-preset", preset,
          "-b:v", str(video_br), "-maxrate", str(int(video_br * 1.3)),
          "-bufsize", str(max(video_br * 2, 240_000)),
          "-c:a", "aac", "-b:a", str(audio_br), str(out)],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        capture_output=True, text=True,
     )
-    if not out.exists() or out.stat().st_size == 0:
-        raise TelegramFileTooLargeError(f"Compression produced no output for {path.name}.")
+    if proc.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        detail = proc.stderr[-300:] if proc.stderr else "no output"
+        raise TelegramFileTooLargeError(f"Compression failed for {path.name}: {detail}")
     if out.stat().st_size > limit:
         raise TelegramFileTooLargeError(
             f"Compressed video still exceeds limit: {out.name} = {out.stat().st_size} bytes."
@@ -248,7 +252,7 @@ def _compress(path: Path, limit: int, preset: str) -> Path:
     return out
 
 
-def _split(path: Path, limit: int, *, _depth: int = 0) -> list[Path]:
+def _split(path: Path, limit: int, workdir: Path, *, _depth: int = 0) -> list[Path]:
     if path.stat().st_size <= limit:
         return [path]
     if _depth >= 4:
@@ -262,26 +266,26 @@ def _split(path: Path, limit: int, *, _depth: int = 0) -> list[Path]:
     seg_secs = max(5, int((limit * 0.9) / bps))
 
     stem = path.stem.replace(".tg", "")
-    pattern = path.with_name(f"{stem}.pt%03d{path.suffix}")
-    subprocess.run(
+    pattern = workdir / f"{stem}.pt%03d{path.suffix}"
+    proc = subprocess.run(
         ["ffmpeg", "-y", "-i", str(path), "-map", "0", "-c", "copy",
          "-f", "segment", "-reset_timestamps", "1",
          "-segment_time", str(seg_secs), str(pattern)],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        capture_output=True, text=True,
     )
-    parts = sorted(path.parent.glob(f"{stem}.pt*{path.suffix}"))
+    if proc.returncode != 0:
+        detail = proc.stderr[-300:] if proc.stderr else "no output"
+        raise TelegramFileTooLargeError(f"Split failed for {path.name}: {detail}")
+    parts = sorted(workdir.glob(f"{stem}.pt*{path.suffix}"))
     if len(parts) <= 1:
         for p in parts:
             p.unlink(missing_ok=True)
-        return _split(path, limit, _depth=_depth + 1)
+        return _split(path, limit, workdir, _depth=_depth + 1)
 
     result: list[Path] = []
     for part in parts:
         if part.stat().st_size <= limit:
             result.append(part)
         else:
-            sub = _split(part, limit, _depth=_depth + 1)
-            if sub != [part]:
-                part.unlink(missing_ok=True)
-            result.extend(sub)
+            result.extend(_split(part, limit, workdir, _depth=_depth + 1))
     return result

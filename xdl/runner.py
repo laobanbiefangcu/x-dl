@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from .config import Settings
+from .utils import MEDIA_SUFFIXES, make_proxies
 
-# 只追踪媒体文件，忽略 .part 临时文件和 metadata JSON
-_MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+logger = logging.getLogger(__name__)
 
 # 输出中包含这些关键词时视为可重试的瞬时网络错误
 _TRANSIENT_ERRORS = ("ssl", "eof", "connection", "timeout", "reset", "broken pipe", "network")
@@ -44,11 +45,9 @@ def run(
     ]
     if use_archive:
         cmd += ["--download-archive", str(settings.archive_file)]
-    if settings.proxy:
-        p = settings.proxy.strip()
-        if p.startswith("socks5://"):
-            p = "socks5h://" + p[len("socks5://"):]
-        cmd += ["--proxy", p]
+    proxies = make_proxies(settings.proxy)
+    if proxies:
+        cmd += ["--proxy", proxies["https"]]
     cmd.append(url)
 
     last_output = ""
@@ -58,12 +57,17 @@ def run(
         output = proc.stderr + proc.stdout
 
         if output.strip():
-            print(output, end="")
+            logger.info(output.rstrip())
 
         if proc.returncode not in (0, 1):
-            print(f"[warn] gallery-dl exited with code {proc.returncode} for {url}")
+            logger.warning("gallery-dl exited with code %d for %s", proc.returncode, url)
 
-        new_files = sorted(_snapshot(base_dir) - before)
+        # mtime 对比：新增文件 OR 被重新下载（覆盖）的文件
+        after = _snapshot(base_dir)
+        new_files = sorted(
+            p for p, mt in after.items()
+            if p not in before or before[p] != mt
+        )
         if new_files:
             return new_files
 
@@ -77,7 +81,7 @@ def run(
         # 瞬时网络错误 → 等待后重试
         if any(k in lower for k in _TRANSIENT_ERRORS) and attempt < retries:
             wait = attempt * 3
-            print(f"[runner] 网络错误，{wait}s 后重试（{attempt}/{retries}）…")
+            logger.warning("[runner] 网络错误，%ds 后重试（%d/%d）…", wait, attempt, retries)
             time.sleep(wait)
             continue
 
@@ -98,10 +102,12 @@ def run(
     return []
 
 
-def _snapshot(directory: Path) -> set[Path]:
+def _snapshot(directory: Path) -> dict[Path, float]:
+    """返回目录内所有媒体文件的 path → mtime 映射。"""
     if not directory.exists():
-        return set()
+        return {}
     return {
-        p for p in directory.rglob("*")
-        if p.is_file() and p.suffix.lower() in _MEDIA_SUFFIXES
+        p: p.stat().st_mtime
+        for p in directory.rglob("*")
+        if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES
     }
