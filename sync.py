@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from xdl.config import load_settings
-from xdl import runner, telegram
+from xdl import runner, telegram, cookies as cookie_checker
 
 # 匹配 gallery-dl 生成的文件名: {author}_{tweet_id}_{num}.{ext}
 _FNAME_RE = re.compile(r"^([^_]+)_(\d{10,})_\d+\.")
@@ -33,6 +33,17 @@ def _group_by_tweet(files: list[Path]) -> dict[str, list[Path]]:
 
 def main() -> None:
     settings = load_settings()
+
+    print("🍪 检测 cookies 有效性…")
+    ok, msg = cookie_checker.check(
+        settings.cookies_file, settings.proxy, str(settings.gdl_config)
+    )
+    if ok:
+        print(f"   ✓ {msg}")
+    else:
+        print(f"   ✗ {msg}")
+        raise SystemExit("cookies 无效，终止同步。")
+
     urls = settings.target_urls()
 
     print(f"同步目标: {', '.join(urls)}")

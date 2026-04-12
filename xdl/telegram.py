@@ -10,7 +10,8 @@ from pathlib import Path
 import requests
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+ANIMATION_SUFFIXES = {".gif"}
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 
 
@@ -95,6 +96,8 @@ def _send_one(path: Path, *, bot_token: str, chat_id: str, caption: str,
         method, field = "sendPhoto", "photo"
     elif suffix in VIDEO_SUFFIXES:
         method, field = "sendVideo", "video"
+    elif suffix in ANIMATION_SUFFIXES:
+        method, field = "sendAnimation", "animation"
     else:
         method, field = "sendDocument", "document"
 

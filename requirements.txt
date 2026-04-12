@@ -1,3 +1,4 @@
-gallery-dl
-python-dotenv
-requests
+gallery-dl==1.31.10
+python-dotenv==1.2.2
+requests==2.33.1
+PySocks==1.7.1

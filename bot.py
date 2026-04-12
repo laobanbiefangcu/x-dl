@@ -29,6 +29,7 @@ from xdl import runner, telegram, cookies as cookie_checker
 TWEET_RE = re.compile(
     r"https?://(?:x|twitter)\.com/\S+/status/\d+\S*"
 )
+_TRAILING_PUNCT = re.compile(r"[.,!?;:'\"()（）。，！？]+$")
 
 _URL_DEDUP_TTL = 300.0  # 5 分钟内同一链接不重复下载
 
@@ -48,6 +49,11 @@ class _URLCache:
                 return True
             self._seen[url] = now
             return False
+
+    def invalidate(self, url: str) -> None:
+        """下载失败时移除记录，允许用户立即重试。"""
+        with self._lock:
+            self._seen.pop(url, None)
 
 
 _url_cache = _URLCache()
@@ -184,6 +190,7 @@ def _process_url(
         _update(f"⚠️ 文件过大: {exc}")
         _log(f"  [{url}] 文件过大: {exc}")
     except Exception as exc:  # noqa: BLE001
+        _url_cache.invalidate(url)  # 允许用户立即重试
         _update(f"❌ 失败: {exc}")
         _log(f"  [{url}] 异常: {exc}")
 
@@ -204,7 +211,7 @@ def handle_message(bot: TelegramBot, executor: ThreadPoolExecutor, message: dict
         _log(f"  → 忽略（chat_id={chat_id} 不在白名单）")
         return
 
-    urls = TWEET_RE.findall(text)
+    urls = [_TRAILING_PUNCT.sub("", u) for u in TWEET_RE.findall(text)]
     if not urls:
         _log("  → 无推文链接，跳过")
         return
