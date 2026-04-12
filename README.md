@@ -48,7 +48,7 @@ sudo apt install python3 python3-venv ffmpeg
 ## 📦 安装
 
 ```bash
-git clone [<repo-url> x-dl](https://github.com/laobanbiefangcu/x-dl.git) && cd x-dl
+git clone https://github.com/laobanbiefangcu/x-dl.git && cd x-dl
 
 # 🔧 创建虚拟环境并安装依赖
 python3 -m venv .venv
