@@ -30,6 +30,24 @@ TWEET_RE = re.compile(
     r"https?://(?:x|twitter)\.com/\S+/status/\d+\S*"
 )
 _TRAILING_PUNCT = re.compile(r"[.,!?;:'\"()（）。，！？]+$")
+_FNAME_RE = re.compile(r"^([^_]+)_(\d{10,})_\d+\.")
+
+
+def _caption(path: Path) -> str:
+    m = _FNAME_RE.match(path.name)
+    if m:
+        author, tweet_id = m.group(1), m.group(2)
+        return f"@{author}\nhttps://x.com/{author}/status/{tweet_id}"
+    return path.stem
+
+
+def _group_by_tweet(files: list[Path]) -> dict[str, list[Path]]:
+    groups: dict[str, list[Path]] = {}
+    for f in files:
+        m = _FNAME_RE.match(f.name)
+        key = m.group(2) if m else f.stem
+        groups.setdefault(key, []).append(f)
+    return groups
 
 _URL_DEDUP_TTL = 300.0  # 5 分钟内同一链接不重复下载
 
@@ -149,6 +167,115 @@ class TelegramBot:
 
 
 # ---------------------------------------------------------------------------
+# Sync task（在线程池中执行）
+# ---------------------------------------------------------------------------
+
+_sync_lock = threading.Lock()
+
+
+def _run_sync(bot: TelegramBot, chat_id: str, reply_to: int, target: str | None = None) -> None:
+    if not _sync_lock.acquire(blocking=False):
+        bot.send_message(chat_id, "⏳ 同步已在进行中，请稍候…", reply_to=reply_to)
+        return
+
+    status_id: int | None = None
+    try:
+        label = {"likes": "点赞", "bookmarks": "书签"}.get(target or "", "书签/点赞")
+        status_id = bot.send_message(chat_id, f"⏳ 正在同步{label}…", reply_to=reply_to)
+        all_urls = bot.s.target_urls()
+        if target == "likes":
+            urls = [u for u in all_urls if "/likes" in u]
+        elif target == "bookmarks":
+            urls = [u for u in all_urls if "bookmarks" in u]
+        else:
+            urls = all_urls
+        if not urls:
+            bot.edit_message(chat_id, status_id, f"⚠️ 未配置{label}目标，请检查 .env 中的 SYNC_TARGETS")
+            return
+        all_new: list[Path] = []
+        for url in urls:
+            _log(f"[sync] → {url}")
+            new_files = runner.run(url, bot.s)
+            all_new.extend(new_files)
+
+        if not all_new:
+            bot.edit_message(chat_id, status_id, "✅ 同步完成，无新内容")
+            return
+
+        groups = _group_by_tweet(all_new)
+        bot.edit_message(chat_id, status_id, f"📤 发现 {len(all_new)} 个新文件，发送中…")
+
+        dest = bot.s.telegram_chat_id or chat_id
+        sent = 0
+        for tweet_id, files in groups.items():
+            cap = _caption(files[0])
+            try:
+                bot.send_files(dest, files, cap)
+                sent += 1
+                if bot.s.delete_after_telegram:
+                    for f in files:
+                        f.unlink(missing_ok=True)
+            except telegram.TelegramFileTooLargeError as exc:
+                _log(f"[sync] {tweet_id} 文件过大: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                _log(f"[sync] {tweet_id} 发送失败: {exc}")
+            time.sleep(bot.s.telegram_rate_limit_seconds)
+
+        bot.edit_message(chat_id, status_id, f"✅ 同步完成，共发送 {sent} 条推文")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"[sync] 异常: {exc}")
+        msg = f"❌ 同步失败: {exc}"
+        if status_id:
+            bot.edit_message(chat_id, status_id, msg)
+        else:
+            bot.send_message(chat_id, msg, reply_to=reply_to)
+    finally:
+        _sync_lock.release()
+
+
+def _clear_archive(bot: TelegramBot, chat_id: str, reply_to: int) -> None:
+    _MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+    download_dir = bot.s.download_dir
+
+    local_files = sorted(
+        f for f in download_dir.rglob("*")
+        if f.is_file() and f.suffix.lower() in _MEDIA_SUFFIXES
+    ) if download_dir.exists() else []
+
+    dest = bot.s.telegram_chat_id or chat_id
+
+    if local_files:
+        groups = _group_by_tweet(local_files)
+        status_id = bot.send_message(
+            chat_id,
+            f"📤 发现 {len(local_files)} 个本地文件（{len(groups)} 条推文），发送到频道后清空…",
+            reply_to=reply_to,
+        )
+        sent = 0
+        for tweet_id, files in groups.items():
+            cap = _caption(files[0])
+            try:
+                bot.send_files(dest, files, cap)
+                sent += 1
+                for f in files:
+                    f.unlink(missing_ok=True)
+            except telegram.TelegramFileTooLargeError as exc:
+                _log(f"[clear] {tweet_id} 文件过大跳过: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                _log(f"[clear] {tweet_id} 发送失败: {exc}")
+            time.sleep(bot.s.telegram_rate_limit_seconds)
+        bot.edit_message(chat_id, status_id, f"✅ 已发送 {sent} 条推文并删除本地文件")
+    else:
+        bot.send_message(chat_id, "📭 本地无媒体文件", reply_to=reply_to)
+
+    archive = bot.s.archive_file
+    if archive.exists():
+        archive.unlink()
+        _log("[clear] archive.db 已删除")
+    bot.send_message(chat_id, "🗑 下载记录已清空，下次同步将重新获取所有内容")
+
+
+# ---------------------------------------------------------------------------
 # Per-URL task（在线程池中执行）
 # ---------------------------------------------------------------------------
 
@@ -209,6 +336,24 @@ def handle_message(bot: TelegramBot, executor: ThreadPoolExecutor, message: dict
 
     if bot.s.bot_allowed_chat_ids and str(chat_id) not in bot.s.bot_allowed_chat_ids:
         _log(f"  → 忽略（chat_id={chat_id} 不在白名单）")
+        return
+
+    cmd_text = text.strip().lower().split("@")[0]  # 去掉 @botname 后缀
+    if cmd_text in ("/sync_likes", "/sync likes"):
+        _log("  → sync likes 命令")
+        executor.submit(_run_sync, bot, str(chat_id), msg_id, "likes")
+        return
+    if cmd_text in ("/sync_bookmarks", "/sync bookmarks"):
+        _log("  → sync bookmarks 命令")
+        executor.submit(_run_sync, bot, str(chat_id), msg_id, "bookmarks")
+        return
+    if cmd_text == "/sync":
+        _log("  → /sync 命令，同步全部")
+        executor.submit(_run_sync, bot, str(chat_id), msg_id, None)
+        return
+    if cmd_text == "/clear":
+        _log("  → /clear 命令，清空 archive")
+        executor.submit(_clear_archive, bot, str(chat_id), msg_id)
         return
 
     urls = [_TRAILING_PUNCT.sub("", u) for u in TWEET_RE.findall(text)]
@@ -291,6 +436,17 @@ def main() -> None:
 
     _log(f"已连接: @{info['username']} ({info['first_name']})")
     _log("白名单 chat_id: " + ", ".join(settings.bot_allowed_chat_ids) if settings.bot_allowed_chat_ids else "无白名单，响应所有人")
+
+    try:
+        bot._call("setMyCommands", commands=[
+            {"command": "sync",           "description": "同步所有目标（书签 + 点赞）"},
+            {"command": "sync_likes",     "description": "只同步点赞"},
+            {"command": "sync_bookmarks", "description": "只同步书签"},
+            {"command": "clear",          "description": "清空下载记录（下次同步将重新获取全部内容）"},
+        ])
+        _log("命令菜单已注册")
+    except Exception as exc:
+        _log(f"[warn] 注册命令菜单失败: {exc}")
 
     def _check_cookies() -> None:
         ok, msg = cookie_checker.check(

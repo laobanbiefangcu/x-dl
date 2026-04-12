@@ -43,7 +43,7 @@ def run(
         "-d", str(base_dir),
     ]
     if use_archive:
-        cmd += ["--archive", str(settings.archive_file)]
+        cmd += ["--download-archive", str(settings.archive_file)]
     if settings.proxy:
         p = settings.proxy.strip()
         if p.startswith("socks5://"):
@@ -67,6 +67,10 @@ def run(
         if new_files:
             return new_files
 
+        # 返回码 0/1 表示 gallery-dl 正常退出，无新文件即为"已是最新"
+        if proc.returncode in (0, 1):
+            return []
+
         last_output = output.strip()
         lower = last_output.lower()
 
@@ -79,17 +83,13 @@ def run(
 
         break  # 非网络错误或已达最大重试次数
 
-    # 分析最终错误原因
+    # 分析最终错误原因（returncode >= 2）
     lower = last_output.lower()
     if "login" in lower or "log in" in lower or "auth" in lower:
         raise RuntimeError("需要登录，请重新导出 cookies.txt")
-    if "deleted" in lower or "no results" in lower or "no result" in lower:
-        if not settings.proxy:
-            raise RuntimeError(
-                "无法获取推文内容。\n"
-                "服务器 IP 被 X 屏蔽，请在 .env 中配置代理：\n"
-                "PROXY=socks5h://127.0.0.1:7890"
-            )
+    if "no results" in lower or "no result" in lower:
+        return []
+    if "deleted" in lower:
         raise RuntimeError("推文无内容（可能已删除、纯文字或账号受限）")
     if any(k in lower for k in _TRANSIENT_ERRORS):
         raise RuntimeError(f"网络连接不稳定，重试 {retries} 次后仍失败，请检查代理")

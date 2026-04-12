@@ -138,7 +138,7 @@ SYNC_TARGETS=https://x.com/user/likes  # 🔗 直接指定 URL
 
 ### 使用方式 💬
 
-直接把推文链接发给 Bot，一次可发多个：
+**发推文链接** — 直接把链接发给 Bot，一次可发多个：
 
 ```
 https://x.com/username/status/1234567890
@@ -151,6 +151,15 @@ Bot 并发下载，完成后推送媒体到频道，私聊状态实时更新：
        ↓ 完成后原地更新为
 ✅ 已发送（3 个文件）
 ```
+
+**命令列表：**
+
+| 命令 | 说明 |
+|------|------|
+| `/sync` | 同步所有目标（书签 + 点赞） |
+| `/sync likes` | 只同步点赞 |
+| `/sync bookmarks` | 只同步书签 |
+| `/clear` | 清空 archive.db 下载记录，下次同步将重新获取全部内容 |
 
 ### 白名单 🔒
 
@@ -192,40 +201,61 @@ BOT_ALLOWED_CHAT_IDS=123456789,987654321
 全部完成。
 ```
 
-### ⏰ 定时执行（cron）
+### ⏰ 定时执行（systemd timer）
+
+项目根目录已包含 `x-dl-sync.service` 和 `x-dl-sync.timer`，默认**每小时同步一次**。
 
 ```bash
-crontab -e
+sudo cp x-dl-sync.service x-dl-sync.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now x-dl-sync.timer
 ```
 
-```cron
-# 每小时同步一次
-0 * * * * /root/x-dl/.venv/bin/python /root/x-dl/sync.py >> /root/x-dl/sync.log 2>&1
+查看定时状态：
+
+```bash
+systemctl status x-dl-sync.timer     # 下次触发时间
+journalctl -u x-dl-sync.service -f   # 实时日志
 ```
+
+如需修改间隔，编辑 `/etc/systemd/system/x-dl-sync.timer` 中的 `OnUnitActiveSec`（支持 `30min`、`2h`、`1d` 等）。
 
 ---
 
 ## 🚀 开机自启
 
-项目根目录已包含 `x-dl-bot.service`。
+项目根目录包含以下 systemd 文件：
 
-> 📝 如果部署路径不是 `/root/x-dl`，先修改 `x-dl-bot.service` 中的 `WorkingDirectory` 和 `ExecStart`。
+| 文件 | 说明 |
+|------|------|
+| `x-dl-bot.service` | Bot 常驻服务 |
+| `x-dl-sync.service` | Sync 单次任务 |
+| `x-dl-sync.timer` | Sync 定时触发器 |
+
+> 📝 如果部署路径不是 `/root/x-dl`，先修改 service 文件中的 `WorkingDirectory` 和 `ExecStart`。
 
 ```bash
-# 安装并启用服务
+# Bot 服务
 sudo cp x-dl-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable x-dl-bot
-sudo systemctl start x-dl-bot
+sudo systemctl enable --now x-dl-bot
+
+# Sync 定时任务
+sudo cp x-dl-sync.service x-dl-sync.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now x-dl-sync.timer
 ```
 
 **日常管理：**
 
 ```bash
-systemctl status x-dl-bot        # 📊 查看运行状态
-systemctl restart x-dl-bot       # 🔄 重启
-journalctl -u x-dl-bot -f        # 📜 实时查看日志
-journalctl -u x-dl-bot -n 50     # 📜 查看最近 50 行
+systemctl status x-dl-bot          # 📊 Bot 运行状态
+systemctl restart x-dl-bot         # 🔄 重启 Bot
+journalctl -u x-dl-bot -f          # 📜 Bot 实时日志
+
+systemctl status x-dl-sync.timer   # ⏰ 下次同步时间
+systemctl start x-dl-sync.service  # ▶️  手动触发一次同步
+journalctl -u x-dl-sync.service -f # 📜 Sync 实时日志
 ```
 
 ---

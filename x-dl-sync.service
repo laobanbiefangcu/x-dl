@@ -1,0 +1,13 @@
+[Unit]
+Description=X-DL Sync (gallery-dl bookmarks/likes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/x-dl
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/x-dl/.venv/bin/python sync.py
+StandardOutput=journal
+StandardError=journal
