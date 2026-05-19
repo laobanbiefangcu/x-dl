@@ -1,6 +1,7 @@
-"""Shared utilities used by both bot.py and sync.py."""
+"""共享工具函数。"""
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -12,20 +13,33 @@ MEDIA_SUFFIXES: frozenset[str] = frozenset({
 _FNAME_RE = re.compile(r"^([^_]+)_(\d{10,})_\d+\.")
 
 
-def caption(path: Path) -> str:
+def parse_filename(path: Path) -> tuple[str | None, str | None]:
+    """返回 (author, tweet_id)，匹配 gallery-dl 的 twitter filename 模板。"""
     m = _FNAME_RE.match(path.name)
     if m:
-        author, tweet_id = m.group(1), m.group(2)
-        return f"@{author}\nhttps://x.com/{author}/status/{tweet_id}"
+        return m.group(1), m.group(2)
+    return None, None
+
+
+def caption(path: Path, tweet_text: str = "") -> str:
+    """构造发送给 Telegram 的 caption。"""
+    author, tweet_id = parse_filename(path)
+    if author and tweet_id:
+        link = f"https://x.com/{author}/status/{tweet_id}"
+        if tweet_text:
+            text = tweet_text.strip()
+            if len(text) > 800:  # Telegram caption 上限 1024，给链接 + 用户名留余量
+                text = text[:800].rstrip() + "…"
+            return f"{text}\n\n@{author}\n{link}"
+        return f"@{author}\n{link}"
     return path.stem
 
 
 def group_by_tweet(files: list[Path]) -> dict[str, list[Path]]:
-    """同一条推文的多个媒体文件归为一组。"""
     groups: dict[str, list[Path]] = {}
     for f in files:
-        m = _FNAME_RE.match(f.name)
-        key = m.group(2) if m else f.stem
+        _, tweet_id = parse_filename(f)
+        key = tweet_id or f.stem
         groups.setdefault(key, []).append(f)
     return groups
 
@@ -40,11 +54,18 @@ def make_proxies(proxy: str) -> dict[str, str] | None:
 
 
 def cleanup_empty_dirs(file_path: Path, base_dir: Path) -> None:
-    """删除文件后，向上递归清理空目录，直到 base_dir 为止。"""
     parent = file_path.parent
     while parent != base_dir and parent != parent.parent:
         try:
-            parent.rmdir()  # 非空时会抛 OSError，自动停止
+            parent.rmdir()
             parent = parent.parent
         except OSError:
             break
+
+
+def file_md5(path: Path, chunk: int = 1 << 20) -> str:
+    h = hashlib.md5()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()

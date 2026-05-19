@@ -7,10 +7,13 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 import requests
 
 from .utils import make_proxies
+
+ProgressCallback = Callable[[int, int], None]  # (sent, total)
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
@@ -47,6 +50,7 @@ def send_files(
     ffmpeg_preset: str = "veryfast",
     rate_limit_seconds: float = 1.5,
     send_retries: int = 3,
+    progress_cb: ProgressCallback | None = None,
 ) -> None:
     if not bot_token or not chat_id:
         raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
@@ -64,6 +68,18 @@ def send_files(
             compress_oversized_video=compress_oversized_video,
             ffmpeg_preset=ffmpeg_preset,
         )
+        total = len(prepared)
+        sent = 0
+
+        def _tick(n: int) -> None:
+            nonlocal sent
+            sent += n
+            if progress_cb:
+                try:
+                    progress_cb(sent, total)
+                except Exception:
+                    pass
+
         first = True
         for chunk in [prepared[i:i + 10] for i in range(0, len(prepared), 10)]:
             if _can_group(chunk):
@@ -71,6 +87,7 @@ def send_files(
                     time.sleep(rate_limit_seconds)
                 _retry(_send_group, send_retries, chunk,
                        caption=caption if first else "", **kwargs)
+                _tick(len(chunk))
                 first = False
             else:
                 for path in chunk:
@@ -78,6 +95,7 @@ def send_files(
                         time.sleep(rate_limit_seconds)
                     _retry(_send_one, send_retries, path,
                            caption=caption if first else "", **kwargs)
+                    _tick(1)
                     first = False
 
 
