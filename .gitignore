@@ -3,6 +3,9 @@
 __pycache__/
 *.pyc
 data/archive.db
+data/xdl.db
+data/xdl.db-wal
+data/xdl.db-shm
 downloads/
 cookies.txt
 *.log
