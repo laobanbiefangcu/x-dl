@@ -311,6 +311,7 @@ async def _do_sync(
     source_chat_id: int,
     reply_to: int,
     target: str | None,
+    quiet: bool = False,
 ) -> None:
     if _state.sync_lock.locked():
         await bot.send_message(
@@ -321,13 +322,19 @@ async def _do_sync(
     async with _state.sync_lock:
         s = _state.settings
         label = {"likes": "点赞", "bookmarks": "书签"}.get(target or "", "书签/点赞")
-        status = _Status(bot, source_chat_id, reply_to)
-        await status.send(f"⏳ 正在同步{label}…")
+        # quiet（定时同步）模式下先不发消息，只有真的有新内容才发，避免频道刷屏
+        status: _Status | None = None
+        if not quiet:
+            status = _Status(bot, source_chat_id, reply_to)
+            await status.send(f"⏳ 正在同步{label}…")
 
         try:
             all_urls = s.target_urls()
         except ValueError as exc:
-            await status.update(f"❌ 配置错误: {exc}", force=True)
+            if status:
+                await status.update(f"❌ 配置错误: {exc}", force=True)
+            else:
+                log.warning("[sync] 配置错误: {}", exc)
             return
 
         if target == "likes":
@@ -338,7 +345,10 @@ async def _do_sync(
             urls = all_urls
 
         if not urls:
-            await status.update(f"⚠️ 未配置{label}目标", force=True)
+            if status:
+                await status.update(f"⚠️ 未配置{label}目标", force=True)
+            else:
+                log.warning("[sync] 未配置{}目标", label)
             return
 
         all_new: list[Path] = []
@@ -346,13 +356,15 @@ async def _do_sync(
         try:
             for url in urls:
                 log.info("[sync] → {}", url)
-                await status.update(f"⏳ 拉取 {url} …")
+                if status:
+                    await status.update(f"⏳ 拉取 {url} …")
                 result = await _state.run_blocking(runner.run, url, s)
                 all_new.extend(result.new_files)
                 all_meta.update(result.tweets)
         except Exception as exc:
             _state.db.stat_set("last_sync_error", str(exc))
-            await status.update(f"❌ 同步失败: {exc}", force=True)
+            if status:
+                await status.update(f"❌ 同步失败: {exc}", force=True)
             log.warning("[sync] 异常: {}", exc)
             return
 
@@ -374,15 +386,19 @@ async def _do_sync(
         if not all_new:
             _state.db.stat_set("last_sync_at", str(time.time()))
             _state.db.stat_set("last_sync_count", "0")
-            await status.update("✅ 同步完成，无新内容", force=True)
+            if status:
+                await status.update("✅ 同步完成，无新内容", force=True)
+            # quiet 模式：无新内容时静默，不在频道留痕
             return
 
         groups = group_by_tweet(all_new)
         dest = s.telegram_chat_id or str(source_chat_id)
-        await status.update(
-            f"📤 发现 {len(all_new)} 个新文件（{len(groups)} 条推文），发送中…",
-            force=True,
-        )
+        # quiet 模式全程静默：只把媒体本身发进频道，不发进度/汇总消息
+        if status:
+            await status.update(
+                f"📤 发现 {len(all_new)} 个新文件（{len(groups)} 条推文），发送中…",
+                force=True,
+            )
 
         sent = await _send_groups(
             bot, groups,
@@ -393,7 +409,8 @@ async def _do_sync(
         )
         _state.db.stat_set("last_sync_at", str(time.time()))
         _state.db.stat_set("last_sync_count", str(sent))
-        await status.update(f"✅ 同步完成，共发送 {sent} 条推文", force=True)
+        if status:
+            await status.update(f"✅ 同步完成，共发送 {sent} 条推文", force=True)
 
         # 顺手做一次配额清理
         if s.download_dir_max_gb > 0:
@@ -736,7 +753,10 @@ async def _scheduler_loop(bot: Bot) -> None:
                 else None
             )
             if target_chat is not None:
-                await _do_sync(bot, source_chat_id=target_chat, reply_to=0, target=None)
+                await _do_sync(
+                    bot, source_chat_id=target_chat, reply_to=0,
+                    target=None, quiet=True,
+                )
             else:
                 log.warning("[scheduler] TELEGRAM_CHAT_ID 未配置或非数字，跳过定时同步")
         except Exception as exc:
